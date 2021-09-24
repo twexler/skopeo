@@ -105,7 +105,7 @@ See skopeo-sync(1) for details.
 	flags.StringVarP(&opts.destination, "dest", "d", "", "DESTINATION transport type")
 	flags.BoolVar(&opts.scoped, "scoped", false, "Images at DESTINATION are prefix using the full source image path as scope")
 	flags.BoolVarP(&opts.all, "all", "a", false, "Copy all images if SOURCE-IMAGE is a list")
-	flags.BoolVar(&opts.dry, "dry", true, "Run without actually copying data")
+	flags.BoolVar(&opts.dry, "dry", false, "Run without actually copying data")
 	flags.AddFlagSet(&sharedFlags)
 	flags.AddFlagSet(&deprecatedTLSVerifyFlags)
 	flags.AddFlagSet(&srcFlags)
