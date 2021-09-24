@@ -10,12 +10,14 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/containers/common/pkg/retry"
 	"github.com/containers/image/v5/copy"
 	"github.com/containers/image/v5/directory"
 	"github.com/containers/image/v5/docker"
 	"github.com/containers/image/v5/docker/reference"
+	"github.com/containers/image/v5/signature"
 	"github.com/containers/image/v5/transports"
 	"github.com/containers/image/v5/types"
 	"github.com/opencontainers/go-digest"
@@ -39,10 +41,12 @@ type syncOptions struct {
 	destination         string         // Destination registry name
 	scoped              bool           // When true, namespace copied images at destination using the source repository name
 	all                 bool           // Copy all of the images if an image in the source is a list
+	parallel            bool           // run sync in parallel, by repo source
 }
 
 // repoDescriptor contains information of a single repository used as a sync source.
 type repoDescriptor struct {
+	Name        string                 // Name of the repo, if transport is 'docker
 	DirBasePath string                 // base path when source is 'dir'
 	ImageRefs   []types.ImageReference // List of tagged image found for the repository
 	Context     *types.SystemContext   // SystemContext for the sync command
@@ -104,6 +108,7 @@ See skopeo-sync(1) for details.
 	flags.StringVarP(&opts.destination, "dest", "d", "", "DESTINATION transport type")
 	flags.BoolVar(&opts.scoped, "scoped", false, "Images at DESTINATION are prefix using the full source image path as scope")
 	flags.BoolVarP(&opts.all, "all", "a", false, "Copy all images if SOURCE-IMAGE is a list")
+	flags.BoolVar(&opts.parallel, "parallel", true, "run yaml-based sync in parallel")
 	flags.AddFlagSet(&sharedFlags)
 	flags.AddFlagSet(&deprecatedTLSVerifyFlags)
 	flags.AddFlagSet(&srcFlags)
@@ -415,9 +420,10 @@ func imagesToCopyFromRegistry(registryName string, cfg registrySyncConfig, sourc
 // It returns a slice of repository descriptors, where each descriptor is a
 // list of tagged image references to be used as sync source, and any error
 // encountered.
-func imagesToCopy(source string, transport string, sourceCtx *types.SystemContext) ([]repoDescriptor, error) {
+func imagesToCopy(source string, transport string, sourceCtx *types.SystemContext, parallel bool) ([]repoDescriptor, error) {
 	var descriptors []repoDescriptor
 
+	var resultsChan chan []repoDescriptor
 	switch transport {
 	case docker.Transport.Name():
 		desc := repoDescriptor{
@@ -473,6 +479,11 @@ func imagesToCopy(source string, transport string, sourceCtx *types.SystemContex
 		if err != nil {
 			return descriptors, err
 		}
+
+		if parallel {
+			resultsChan = make(chan []repoDescriptor, len(cfg))
+		}
+
 		for registryName, registryConfig := range cfg {
 			if len(registryConfig.Images) == 0 && len(registryConfig.ImagesByTagRegex) == 0 {
 				logrus.WithFields(logrus.Fields{
@@ -481,24 +492,49 @@ func imagesToCopy(source string, transport string, sourceCtx *types.SystemContex
 				continue
 			}
 
-			descs, err := imagesToCopyFromRegistry(registryName, registryConfig, *sourceCtx)
-			if err != nil {
-				return descriptors, errors.Wrapf(err, "Failed to retrieve list of images from registry %q", registryName)
+			if parallel {
+				go func(name string, config registrySyncConfig) {
+					descs, err := imagesToCopyFromRegistry(name, config, *sourceCtx)
+					if err != nil {
+						logrus.WithError(err).WithField("registryName", name).Error("Failed to retrieve list of images from registry")
+						return
+					}
+					resultsChan <- descs
+				}(registryName, registryConfig)
+
+			} else {
+				descs, err := imagesToCopyFromRegistry(registryName, registryConfig, *sourceCtx)
+				if err != nil {
+					return descriptors, errors.Wrapf(err, "Failed to retrieve list of images from registry %q", registryName)
+				}
+
+				descriptors = append(descriptors, descs...)
+			}
+		}
+	}
+
+	if parallel {
+		count := 1
+		for descs := range resultsChan {
+			if count == cap(resultsChan) {
+				close(resultsChan)
+				break
 			}
 			descriptors = append(descriptors, descs...)
+			count++
 		}
 	}
 
 	return descriptors, nil
 }
 
-func (opts *syncOptions) run(args []string, stdout io.Writer) error {
+func (syncOpts *syncOptions) run(args []string, stdout io.Writer) error {
 	if len(args) != 2 {
 		return errorShouldDisplayUsage{errors.New("Exactly two arguments expected")}
 	}
-	opts.deprecatedTLSVerify.warnIfUsed([]string{"--src-tls-verify", "--dest-tls-verify"})
+	syncOpts.deprecatedTLSVerify.warnIfUsed([]string{"--src-tls-verify", "--dest-tls-verify"})
 
-	policyContext, err := opts.global.getPolicyContext()
+	policyContext, err := syncOpts.global.getPolicyContext()
 	if err != nil {
 		return errors.Wrapf(err, "Error loading trust policy")
 	}
@@ -514,64 +550,64 @@ func (opts *syncOptions) run(args []string, stdout io.Writer) error {
 		return
 	}
 
-	if len(opts.source) == 0 {
+	if len(syncOpts.source) == 0 {
 		return errors.New("A source transport must be specified")
 	}
-	if !contains(opts.source, []string{docker.Transport.Name(), directory.Transport.Name(), "yaml"}) {
-		return errors.Errorf("%q is not a valid source transport", opts.source)
+	if !contains(syncOpts.source, []string{docker.Transport.Name(), directory.Transport.Name(), "yaml"}) {
+		return errors.Errorf("%q is not a valid source transport", syncOpts.source)
 	}
 
-	if len(opts.destination) == 0 {
+	if len(syncOpts.destination) == 0 {
 		return errors.New("A destination transport must be specified")
 	}
-	if !contains(opts.destination, []string{docker.Transport.Name(), directory.Transport.Name()}) {
-		return errors.Errorf("%q is not a valid destination transport", opts.destination)
+	if !contains(syncOpts.destination, []string{docker.Transport.Name(), directory.Transport.Name()}) {
+		return errors.Errorf("%q is not a valid destination transport", syncOpts.destination)
 	}
 
-	if opts.source == opts.destination && opts.source == directory.Transport.Name() {
+	if syncOpts.source == syncOpts.destination && syncOpts.source == directory.Transport.Name() {
 		return errors.New("sync from 'dir' to 'dir' not implemented, consider using rsync instead")
 	}
 
 	imageListSelection := copy.CopySystemImage
-	if opts.all {
+	if syncOpts.all {
 		imageListSelection = copy.CopyAllImages
 	}
 
-	sourceCtx, err := opts.srcImage.newSystemContext()
+	sourceCtx, err := syncOpts.srcImage.newSystemContext()
 	if err != nil {
 		return err
 	}
 
 	var manifestType string
-	if opts.format.present {
-		manifestType, err = parseManifestFormat(opts.format.value)
+	if syncOpts.format.present {
+		manifestType, err = parseManifestFormat(syncOpts.format.value)
 		if err != nil {
 			return err
 		}
 	}
 
-	ctx, cancel := opts.global.commandTimeoutContext()
+	ctx, cancel := syncOpts.global.commandTimeoutContext()
 	defer cancel()
 
 	sourceArg := args[0]
 	var srcRepoList []repoDescriptor
 	if err = retry.RetryIfNecessary(ctx, func() error {
-		srcRepoList, err = imagesToCopy(sourceArg, opts.source, sourceCtx)
+		srcRepoList, err = imagesToCopy(sourceArg, syncOpts.source, sourceCtx, syncOpts.parallel)
 		return err
-	}, opts.retryOpts); err != nil {
+	}, syncOpts.retryOpts); err != nil {
 		return err
 	}
 
 	destination := args[1]
-	destinationCtx, err := opts.destImage.newSystemContext()
+	destinationCtx, err := syncOpts.destImage.newSystemContext()
 	if err != nil {
 		return err
 	}
 
 	imagesNumber := 0
-	options := copy.Options{
-		RemoveSignatures:                      opts.removeSignatures,
-		SignBy:                                opts.signByFingerprint,
+	copyOpts := copy.Options{
+		RemoveSignatures:                      syncOpts.removeSignatures,
+		SignBy:                                syncOpts.signByFingerprint,
 		ReportWriter:                          os.Stdout,
 		DestinationCtx:                        destinationCtx,
 		ImageListSelection:                    imageListSelection,
@@ -579,47 +615,81 @@ func (opts *syncOptions) run(args []string, stdout io.Writer) error {
 		ForceManifestMIMEType:                 manifestType,
 	}
 
+	var wg sync.WaitGroup
+
 	for _, srcRepo := range srcRepoList {
-		options.SourceCtx = srcRepo.Context
-		for counter, ref := range srcRepo.ImageRefs {
-			var destSuffix string
-			switch ref.Transport() {
-			case docker.Transport:
-				// docker -> dir or docker -> docker
-				destSuffix = ref.DockerReference().String()
-			case directory.Transport:
-				// dir -> docker (we don't allow `dir` -> `dir` sync operations)
-				destSuffix = strings.TrimPrefix(ref.StringWithinTransport(), srcRepo.DirBasePath)
-				if destSuffix == "" {
-					// if source is a full path to an image, have destPath scoped to repo:tag
-					destSuffix = path.Base(srcRepo.DirBasePath)
+		if syncOpts.parallel {
+			wg.Add(1)
+			go func(repo repoDescriptor) {
+				images, err := syncRepo(ctx, copyOpts, syncOpts, repo, destinationCtx, destination, policyContext)
+				if err != nil {
+					logrus.WithError(err).WithField("repo", srcRepo.Name).Error("error synchronizing repository")
 				}
-			}
-
-			if !opts.scoped {
-				destSuffix = path.Base(destSuffix)
-			}
-
-			destRef, err := destinationReference(path.Join(destination, destSuffix), opts.destination)
-			if err != nil {
-				return err
-			}
-
-			logrus.WithFields(logrus.Fields{
-				"from": transports.ImageName(ref),
-				"to":   transports.ImageName(destRef),
-			}).Infof("Copying image ref %d/%d", counter+1, len(srcRepo.ImageRefs))
-
-			if err = retry.RetryIfNecessary(ctx, func() error {
-				_, err = copy.Image(ctx, policyContext, destRef, ref, &options)
-				return err
-			}, opts.retryOpts); err != nil {
-				return errors.Wrapf(err, "Error copying ref %q", transports.ImageName(ref))
-			}
-			imagesNumber++
+				imagesNumber += images
+				wg.Done()
+			}(srcRepo)
+		} else {
+			syncRepo(ctx, copyOpts, syncOpts, srcRepo, destinationCtx, destination, policyContext)
 		}
+	}
+
+	if syncOpts.parallel {
+		wg.Wait()
 	}
 
 	logrus.Infof("Synced %d images from %d sources", imagesNumber, len(srcRepoList))
 	return nil
+}
+
+func syncRepo(
+	ctx context.Context,
+	copyOpts copy.Options,
+	syncOpts *syncOptions,
+	srcRepo repoDescriptor,
+	destinationCtx *types.SystemContext,
+	destination string,
+	policyContext *signature.PolicyContext,
+) (int, error) {
+	imagesNumber := 0
+	copyOpts.SourceCtx = srcRepo.Context
+	for counter, ref := range srcRepo.ImageRefs {
+		var destSuffix string
+		switch ref.Transport() {
+		case docker.Transport:
+			// docker -> dir or docker -> docker
+			destSuffix = ref.DockerReference().String()
+		case directory.Transport:
+			// dir -> docker (we don't allow `dir` -> `dir` sync operations)
+			destSuffix = strings.TrimPrefix(ref.StringWithinTransport(), srcRepo.DirBasePath)
+			if destSuffix == "" {
+				// if source is a full path to an image, have destPath scoped to repo:tag
+				destSuffix = path.Base(srcRepo.DirBasePath)
+			}
+		}
+
+		if !syncOpts.scoped {
+			destSuffix = path.Base(destSuffix)
+		}
+
+		destRef, err := destinationReference(path.Join(destination, destSuffix), syncOpts.destination)
+		if err != nil {
+			return imagesNumber, err
+		}
+
+		to := transports.ImageName(destRef)
+		from := transports.ImageName(ref)
+		logrus.WithFields(logrus.Fields{
+			"from": from,
+			"to":   to,
+		}).Infof("Copying image ref %d/%d", counter+1, len(srcRepo.ImageRefs))
+
+		if err = retry.RetryIfNecessary(ctx, func() error {
+			_, err = copy.Image(ctx, policyContext, destRef, ref, &copyOpts)
+			return err
+		}, syncOpts.retryOpts); err != nil {
+			return imagesNumber, errors.Wrapf(err, "Error copying ref %q", from)
+		}
+		imagesNumber++
+	}
+	return imagesNumber, nil
 }
