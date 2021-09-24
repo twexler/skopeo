@@ -605,9 +605,22 @@ func (opts *syncOptions) run(args []string, stdout io.Writer) error {
 				return err
 			}
 
+			to := transports.ImageName(destRef)
+			source, err := destRef.NewImageSource(ctx, destinationCtx)
+			if err != nil {
+				if !strings.Contains(err.Error(), "manifest unknown") {
+					logrus.WithError(err).WithField("ref", to).Error("unable to get image source, unknown error, skipping")
+					continue
+				}
+			} else {
+				logrus.WithField("ref", ref.DockerReference().String()).Info("ref present in destination, skipping")
+				continue
+			}
+			source.Close()
+
 			logrus.WithFields(logrus.Fields{
 				"from": transports.ImageName(ref),
-				"to":   transports.ImageName(destRef),
+				"to":   to,
 			}).Infof("Copying image ref %d/%d", counter+1, len(srcRepo.ImageRefs))
 
 			if err = retry.RetryIfNecessary(ctx, func() error {
