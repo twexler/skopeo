@@ -39,6 +39,7 @@ type syncOptions struct {
 	destination         string         // Destination registry name
 	scoped              bool           // When true, namespace copied images at destination using the source repository name
 	all                 bool           // Copy all of the images if an image in the source is a list
+	dry                 bool           // Don't actually copy anything, just output what it would have done
 }
 
 // repoDescriptor contains information of a single repository used as a sync source.
@@ -104,6 +105,7 @@ See skopeo-sync(1) for details.
 	flags.StringVarP(&opts.destination, "dest", "d", "", "DESTINATION transport type")
 	flags.BoolVar(&opts.scoped, "scoped", false, "Images at DESTINATION are prefix using the full source image path as scope")
 	flags.BoolVarP(&opts.all, "all", "a", false, "Copy all images if SOURCE-IMAGE is a list")
+	flags.BoolVar(&opts.dry, "dry", true, "Run without actually copying data")
 	flags.AddFlagSet(&sharedFlags)
 	flags.AddFlagSet(&deprecatedTLSVerifyFlags)
 	flags.AddFlagSet(&srcFlags)
@@ -604,19 +606,22 @@ func (opts *syncOptions) run(args []string, stdout io.Writer) error {
 			if err != nil {
 				return err
 			}
-
-			logrus.WithFields(logrus.Fields{
+			fromToFields := logrus.Fields{
 				"from": transports.ImageName(ref),
 				"to":   transports.ImageName(destRef),
-			}).Infof("Copying image ref %d/%d", counter+1, len(srcRepo.ImageRefs))
-
-			if err = retry.RetryIfNecessary(ctx, func() error {
-				_, err = copy.Image(ctx, policyContext, destRef, ref, &options)
-				return err
-			}, opts.retryOpts); err != nil {
-				return errors.Wrapf(err, "Error copying ref %q", transports.ImageName(ref))
 			}
-			imagesNumber++
+			logrus.WithFields(fromToFields).Infof("Copying image ref %d/%d", counter+1, len(srcRepo.ImageRefs))
+			if opts.dry {
+				logrus.WithFields(fromToFields).Info("Would have copied image, but `--dry` is specified")
+			} else {
+				if err = retry.RetryIfNecessary(ctx, func() error {
+					_, err = copy.Image(ctx, policyContext, destRef, ref, &options)
+					return err
+				}, opts.retryOpts); err != nil {
+					return errors.Wrapf(err, "Error copying ref %q", transports.ImageName(ref))
+				}
+				imagesNumber++
+			}
 		}
 	}
 
