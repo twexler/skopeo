@@ -52,7 +52,7 @@ Path of the authentication file for the destination registry. Uses path given by
 
 **--dry**
 
-Run the sync without actually copying data to the destination
+Run the sync without actually copying data to the destination.
 
 **--src**, **-s** _transport_ Transport for the source repository.
 
