@@ -50,7 +50,7 @@ Path of the authentication file for the source registry. Uses path given by `--a
 
 Path of the authentication file for the destination registry. Uses path given by `--authfile`, if not provided.
 
-**--dry**
+**--dry-run**
 
 Run the sync without actually copying data to the destination.
 
