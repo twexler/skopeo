@@ -615,7 +615,7 @@ func (opts *syncOptions) run(args []string, stdout io.Writer) error {
 				"to":   transports.ImageName(destRef),
 			}
 			if opts.dryRun {
-				logrus.WithFields(fromToFields).Info("Would have copied image ref %d/%d", counter+1, len(srcRepo.ImageRefs))
+				logrus.WithFields(fromToFields).Infof("Would have copied image ref %d/%d", counter+1, len(srcRepo.ImageRefs))
 			} else {
 				logrus.WithFields(fromToFields).Infof("Copying image ref %d/%d", counter+1, len(srcRepo.ImageRefs))
 				if err = retry.RetryIfNecessary(ctx, func() error {
