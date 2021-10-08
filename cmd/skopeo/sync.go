@@ -621,22 +621,21 @@ func (opts *syncOptions) run(args []string, stdout io.Writer) error {
 				logrus.WithFields(fromToFields).Infof("Would have copied image ref %d/%d", counter+1, len(srcRepo.ImageRefs))
 			} else {
 				logrus.WithFields(fromToFields).Infof("Copying image ref %d/%d", counter+1, len(srcRepo.ImageRefs))
-        retryFunc := func() error {
-				  _, err = copy.Image(ctx, policyContext, destRef, ref, &options)
-				  return err
-			  }
-			  if err = retry.RetryIfNecessary(ctx, retryFunc, opts.retryOpts); err != nil {
-				  if !opts.keepGoing {
-					  return errors.Wrapf(err, "Error copying ref %q", transports.ImageName(ref))
-				  }
-				  // log the error, keep a note that there was a failure and move on to the next
-				  // image ref
-				  errorsPresent = true
-				  logrus.WithError(err).Errorf("Error copying ref %q", transports.ImageName(ref))
-				  continue
-        }
-        imagesNumber++
-			} 
+				if err = retry.RetryIfNecessary(ctx, func() error {
+					_, err = copy.Image(ctx, policyContext, destRef, ref, &options)
+					return err
+				}, opts.retryOpts); err != nil {
+					if !opts.keepGoing {
+						return errors.Wrapf(err, "Error copying ref %q", transports.ImageName(ref))
+					}
+					// log the error, keep a note that there was a failure and move on to the next
+					// image ref
+					errorsPresent = true
+					logrus.WithError(err).Errorf("Error copying ref %q", transports.ImageName(ref))
+					continue
+				}
+				imagesNumber++
+			}
 		}
 	}
 
