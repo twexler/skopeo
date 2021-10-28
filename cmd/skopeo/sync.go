@@ -634,12 +634,16 @@ func (opts *syncOptions) run(args []string, stdout io.Writer) error {
 					logrus.WithError(err).Errorf("Error copying ref %q", transports.ImageName(ref))
 					continue
 				}
-				imagesNumber++
 			}
+			imagesNumber++
 		}
 	}
 
-	logrus.Infof("Synced %d images from %d sources", imagesNumber, len(srcRepoList))
+	logMsg := fmt.Sprintf("Synced %d images from %d sources", imagesNumber, len(srcRepoList))
+	if opts.dryRun {
+		logMsg = fmt.Sprintf("Would have %s", logMsg)
+	}
+	logrus.Infof(logMsg)
 	if !errorsPresent {
 		return nil
 	}
